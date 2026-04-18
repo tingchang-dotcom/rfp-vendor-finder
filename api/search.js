@@ -1,156 +1,166 @@
 import Anthropic from '@anthropic-ai/sdk'
 
-export const config = { runtime: 'edge' }
+// Node.js runtime (default) — reliably reads .env.local in vercel dev
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+function buildSystemPrompt(criteria, vendorCount) {
+  const criteriaText = criteria.map(c => `  - ${c.label} (${c.weight}%)`).join('\n')
+  return `You are an expert procurement research assistant who finds vendors for RFP sourcing.
 
-function sseEvent(data) {
-  return `data: ${JSON.stringify(data)}\n\n`
-}
+Your task:
+1. Run ${Math.ceil(vendorCount / 2)} targeted web searches to identify ${vendorCount} relevant vendors
+2. For each vendor found, research their profile and score them against the criteria
+3. Output each vendor as a JSON block as soon as you've researched it — do not wait until the end
 
-export default async function handler(req) {
-  if (req.method !== 'POST') {
-    return new Response('Method not allowed', { status: 405 })
-  }
-
-  let body
-  try {
-    body = await req.json()
-  } catch {
-    return new Response('Invalid JSON', { status: 400 })
-  }
-
-  const { brief, criteria, vendorCount } = body
-  if (!brief || !criteria?.length) {
-    return new Response('Missing brief or criteria', { status: 400 })
-  }
-
-  const criteriaText = criteria
-    .map(c => `- ${c.label} (weight: ${c.weight}%)`)
-    .join('\n')
-
-  const systemPrompt = `You are an expert procurement research assistant. Your job is to find vendors for an RFP sourcing brief.
-
-When given a sourcing brief and scoring criteria, you will:
-1. Run targeted web searches to identify relevant vendors
-2. Research each vendor's profile, capabilities, and fit
-3. Score each vendor 0-100 against the provided criteria
-4. Return structured results as you find them
-
-For each vendor you find, output a JSON object on a single line starting with VENDOR: like this:
-VENDOR: {"id":"unique-id","name":"Vendor Name","company":"Company Name","category":"Category","score":85,"description":"2-3 sentence description of the vendor and why they fit","rationale":"Specific reasoning for this fit score referencing the criteria","tags":["Tag 1","Tag 2"],"sourceUrl":"https://example.com"}
-
-Also output progress steps starting with STEP: like this:
-STEP: {"status":"done","message":"Running search: cloud ERP Southeast Asia"}
-STEP: {"status":"active","message":"Researching vendor profiles..."}
-
-Rules:
-- Find ${vendorCount || '8-10'} vendors
-- Score honestly — not every vendor should score 80+
-- Always include a real source URL you found during research
-- Keep descriptions factual and based on what you found
-- The disclaimer "verify before inviting to RFP" is already shown in the UI — no need to repeat it`
-
-  const userPrompt = `Sourcing brief: ${brief}
-
-Scoring criteria:
+Scoring criteria (weights sum to 100%):
 ${criteriaText}
 
-Please research and find ${vendorCount || '8-10'} vendors. Output each vendor as you find them.`
+OUTPUT FORMAT — for each vendor, output exactly this block on its own lines:
+[VENDOR_START]
+{"id":"v1","name":"Vendor Name","company":"Company Inc","category":"Category","score":82,"description":"2-3 sentence description of what they do and why they fit the brief","rationale":"Specific reasoning referencing the criteria weights","tags":["Tag1","Tag2","Tag3"],"sourceUrl":"https://actual-url-you-found"}
+[VENDOR_END]
 
-  const encoder = new TextEncoder()
+Rules:
+- Output each [VENDOR_START]...[VENDOR_END] block as you research each vendor, not all at once at the end
+- Score honestly on a 0-100 scale — not every vendor should score above 80
+- sourceUrl must be a real URL you found via web search, not a guessed URL
+- Keep descriptions factual and based on search results
+- Find exactly ${vendorCount} vendors`
+}
 
-  const stream = new ReadableStream({
-    async start(controller) {
-      try {
-        // Step 1: announce start
-        controller.enqueue(encoder.encode(sseEvent({
-          type: 'step',
-          status: 'active',
-          message: `Analysing sourcing brief and preparing searches…`,
-        })))
+function buildUserPrompt(brief, vendorCount) {
+  return `Sourcing brief: ${brief}
 
-        const response = await client.messages.create({
-          model: 'claude-sonnet-4-6',
-          max_tokens: 8192,
-          system: systemPrompt,
-          messages: [{ role: 'user', content: userPrompt }],
-          tools: [{
-            type: 'web_search_20250305',
-            name: 'web_search',
-          }],
-          stream: true,
-        })
+Please find ${vendorCount} vendors. Run searches, research each one, and output each vendor block as you finish researching it.`
+}
 
-        let fullText = ''
-        let vendorCount = 0
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.status(405).end('Method not allowed')
+    return
+  }
 
-        for await (const event of response) {
-          if (event.type === 'content_block_delta') {
-            if (event.delta.type === 'text_delta') {
-              fullText += event.delta.text
+  const body = req.body
+  const { brief, criteria, vendorCount: vendorCountStr } = body || {}
+  if (!brief || !criteria?.length) {
+    res.status(400).end('Missing brief or criteria')
+    return
+  }
 
-              // Parse complete lines for VENDOR: and STEP: markers
-              const lines = fullText.split('\n')
-              // Keep last incomplete line in buffer
-              fullText = lines.pop()
+  const vendorCount = vendorCountStr === '5-7' ? 6 : vendorCountStr === '12-15' ? 12 : 9
 
-              for (const line of lines) {
-                const trimmed = line.trim()
-                if (trimmed.startsWith('VENDOR:')) {
-                  try {
-                    const vendor = JSON.parse(trimmed.slice(7).trim())
-                    vendorCount++
-                    vendor.id = vendor.id || `vendor-${vendorCount}`
-                    controller.enqueue(encoder.encode(sseEvent({ type: 'vendor', vendor })))
-                  } catch {}
-                } else if (trimmed.startsWith('STEP:')) {
-                  try {
-                    const step = JSON.parse(trimmed.slice(5).trim())
-                    controller.enqueue(encoder.encode(sseEvent({ type: 'step', ...step })))
-                  } catch {}
-                }
-              }
-            }
-          } else if (event.type === 'tool_use' || event.type === 'content_block_start') {
-            if (event.content_block?.type === 'tool_use') {
-              const query = event.content_block.input?.query || 'web search'
-              controller.enqueue(encoder.encode(sseEvent({
-                type: 'step',
-                status: 'done',
-                message: `Running search: "${query}"`,
-              })))
-            }
+  const apiKey = process.env.ANTHROPIC_API_KEY
+  console.log('[search] apiKey present:', !!apiKey, 'length:', apiKey?.length)
+
+  const client = new Anthropic({ apiKey })
+
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Connection', 'keep-alive')
+  res.setHeader('Access-Control-Allow-Origin', '*')
+
+  const write = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`)
+
+  try {
+    console.log('[search] brief:', brief.slice(0, 80))
+    console.log('[search] vendorCount:', vendorCount)
+    write({ type: 'step', status: 'active', message: 'Analysing sourcing brief…' })
+
+    const response = await client.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 16000,
+      system: buildSystemPrompt(criteria, vendorCount),
+      messages: [{ role: 'user', content: buildUserPrompt(brief, vendorCount) }],
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      stream: true,
+    })
+
+    let textBuffer = ''
+    let searchCount = 0
+    let vendorsFound = 0
+    let inputBuffer = ''
+    let currentToolName = null
+
+    for await (const event of response) {
+      console.log('[event]', event.type, event.content_block?.type || event.delta?.type || '')
+
+      if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
+        currentToolName = event.content_block.name
+        inputBuffer = ''
+        if (currentToolName === 'web_search') {
+          searchCount++
+          console.log('[search] web_search started #', searchCount)
+        }
+      }
+
+      if (event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta') {
+        inputBuffer += event.delta.partial_json || ''
+      }
+
+      if (event.type === 'content_block_stop' && currentToolName === 'web_search') {
+        let query = `search ${searchCount}`
+        try {
+          const parsed = JSON.parse(inputBuffer)
+          if (parsed.query) query = parsed.query
+        } catch {}
+        console.log('[search] web_search query:', query)
+        write({ type: 'step', status: 'done', message: `Searching: "${query}"` })
+        currentToolName = null
+        inputBuffer = ''
+      }
+
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+        textBuffer += event.delta.text
+
+        let startIdx
+        while ((startIdx = textBuffer.indexOf('[VENDOR_START]')) !== -1) {
+          const endIdx = textBuffer.indexOf('[VENDOR_END]', startIdx)
+          if (endIdx === -1) break
+
+          const block = textBuffer.slice(startIdx + 14, endIdx).trim()
+          textBuffer = textBuffer.slice(endIdx + 12)
+
+          try {
+            const vendor = JSON.parse(block)
+            if (!vendor.id) vendor.id = `v-${Date.now()}-${Math.random().toString(36).slice(2)}`
+            vendorsFound++
+            console.log('[search] vendor parsed:', vendor.name, '(total:', vendorsFound, ')')
+            write({ type: 'vendor', vendor })
+          } catch (parseErr) {
+            console.log('[search] vendor parse error:', parseErr.message, 'block:', block.slice(0, 100))
           }
         }
-
-        // Parse any remaining buffered text
-        if (fullText.trim().startsWith('VENDOR:')) {
-          try {
-            const vendor = JSON.parse(fullText.trim().slice(7).trim())
-            vendorCount++
-            vendor.id = vendor.id || `vendor-${vendorCount}`
-            controller.enqueue(encoder.encode(sseEvent({ type: 'vendor', vendor })))
-          } catch {}
-        }
-
-        controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-      } catch (err) {
-        controller.enqueue(encoder.encode(sseEvent({
-          type: 'error',
-          message: err.message || 'Search failed',
-        })))
-      } finally {
-        controller.close()
       }
-    },
-  })
+    }
 
-  return new Response(stream, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-    },
-  })
+    // Parse any remaining complete vendor blocks
+    let startIdx
+    while ((startIdx = textBuffer.indexOf('[VENDOR_START]')) !== -1) {
+      const endIdx = textBuffer.indexOf('[VENDOR_END]', startIdx)
+      if (endIdx === -1) break
+      const block = textBuffer.slice(startIdx + 14, endIdx).trim()
+      textBuffer = textBuffer.slice(endIdx + 12)
+      try {
+        const vendor = JSON.parse(block)
+        if (!vendor.id) vendor.id = `v-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        write({ type: 'vendor', vendor })
+      } catch {}
+    }
+
+    // Log token usage from the final message_delta event
+    try {
+      const finalUsage = response?.finalMessage?.usage
+      if (finalUsage) {
+        console.log('[search] tokens — input:', finalUsage.input_tokens, 'output:', finalUsage.output_tokens, 'total:', finalUsage.input_tokens + finalUsage.output_tokens)
+      }
+    } catch {}
+
+    console.log('[search] done. vendors found:', vendorsFound)
+    write({ type: 'step', status: 'done', message: 'Research complete' })
+    res.write('data: [DONE]\n\n')
+  } catch (err) {
+    console.error('[search] error:', err.message)
+    write({ type: 'error', message: err.message || 'Search failed' })
+  } finally {
+    res.end()
+  }
 }

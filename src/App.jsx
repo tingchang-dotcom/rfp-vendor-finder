@@ -51,15 +51,21 @@ export default function App() {
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue
           const data = line.slice(6).trim()
-          if (data === '[DONE]') continue
+          if (data === '[DONE]') { console.log('[client] stream DONE'); continue }
           try {
             const event = JSON.parse(data)
+            console.log('[client] event:', event.type, event.message || event.vendor?.name || '')
             if (event.type === 'step') {
               setAgentSteps(prev => [...prev, event])
             } else if (event.type === 'vendor') {
               setVendors(prev => [...prev, event.vendor])
+            } else if (event.type === 'error') {
+              console.error('[client] server error:', event.message)
+              setAgentSteps(prev => [...prev, { type: 'step', status: 'error', message: `Error: ${event.message}` }])
             }
-          } catch {}
+          } catch (e) {
+            console.log('[client] parse fail:', line.slice(0, 100))
+          }
         }
       }
     } catch (err) {
